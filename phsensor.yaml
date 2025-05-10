@@ -1,99 +1,184 @@
-
 esphome:
   name: phsensor
-
 esp8266:
   board: d1_mini
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-
   manual_ip:
     static_ip: ip
     gateway: gateway
     subnet: subnet
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-  ap:
-    ssid: "temp"
-    password: "temp12345"
+    dns1: dns1
 
 captive_portal:
 
-# Enable logging
+# Enable logging with more detail during setup/calibration
 logger:
-  level: WARN
+  level: INFO  # Change to WARN after everything is working well
 
 # Enable Home Assistant API
 api:
   encryption:
-    key: !secret api_encryption_key
+    key: !secret api_encryption_key  # More secure with encryption
 
-web_server:
-  version: 3
-
+# Enable Over-the-Air updates
 ota:
   - platform: esphome
     password: !secret ota_password
 
+# Add a web interface for troubleshooting
+web_server:
+  version: 3
+
+# Add time synchronization
 time:
-  - platform: homeassistant
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Lisbon
 
-debug:
-  update_interval: 30s
-
+# Improved ADC reading strategies
 sensor:
+  # Diagnostic sensor to monitor ESP health
+  - platform: wifi_signal
+    name: "WiFi Signal Strength"
+    update_interval: 60s
+    
+  - platform: uptime
+    name: "Uptime"
+  
+  
+    
+  #- platform: adc
+  #  pin: VCC
+  #  name: "VCC Voltage"
+  #  update_interval: 60s
+
+  # Raw voltage reading with extensive filtering
+
   - platform: adc
     pin: A0
-    id: ph_voltage_raw
-    name: "pH Sensor Voltage"
-    update_interval: 10s
+    id: ph_raw_voltage
+    name: "pH Raw Voltage"
+    update_interval: 1s
     unit_of_measurement: "V"
-    accuracy_decimals: 3
+    accuracy_decimals: 4
+
+  - platform: template
+    id: ph_voltage
+    lambda: |-
+      return id(ph_raw_voltage).state;
+    name: "pH Voltage"
+    update_interval: 1s
+    unit_of_measurement: "V"
+    accuracy_decimals: 4
     filters:
       - median:
-          window_size: 5
-          send_every: 2
-          send_first_at: 1
+          window_size: 15
+          send_every: 5
+          send_first_at: 5
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 5
+      - throttle: 5s
 
+  # Separate sensor with calibration applied
   - platform: template
     name: "pH Sensor"
     id: ph
-    unit_of_measurement: "pH"
-    accuracy_decimals: 2
-    update_interval: 10s
     lambda: |-
-      if (isnan(id(ph_voltage_raw).state)) return NAN;
-      // Substitua pelos valores da sua calibragem
-      float voltage = id(ph_voltage_raw).state;
-      return 7.0 + (voltage - 0.57) * (4.0 - 7.0) / (0.65 - 0.57);
+      return id(ph_voltage).state;
+    update_interval: 5s
+    unit_of_measurement: "pH"
+    device_class: "ph"
+    state_class: "measurement"
+    accuracy_decimals: 2
+    filters:
+      # Measured voltage -> Actual pH (buffer solution)
+      # Add your actual pH 9.18, 7.0, and 4.0 calibration values
+      - calibrate_linear:
+          - 0.68 -> 4.0  # Most acidic calibration point 0.65
+          - 0.55 -> 7.2  # Neutral calibration point 0.57
+          #- 0.49 -> 9.0  # Most alkaline calibration point
 
+# Text sensor to display pH status
+text_sensor:
+  - platform: template
+    name: "pH Status"
+    id: ph_status
+    lambda: |-
+      if (id(ph).state < 4) {
+        return {"Muito Acido"};
+      } else if (id(ph).state < 5) {
+        return {"Acido"};
+      } else if (id(ph).state < 7) {
+        return {"Ligeiramente Acido"};
+      } else if (id(ph).state < 8) {
+        return {"Neutro"};
+      } else if (id(ph).state < 10) {
+        return {"Ligeiramente alcalino"};
+      } else if (id(ph).state < 11) {
+        return {"Alcalino"};
+      } else {
+        return {"Muito Alcalino"};
+      }
+    update_interval: 5s
+
+  - platform: wifi_info
+    ip_address:
+      name: ESP IP Address
+    ssid:
+      name: ESP Connected SSID
+    dns_address:
+      name: ESP DNS Address
+
+# I2C Configuration for display
 i2c:
   sda: D2
   scl: D1
   scan: false
   
+# Display configuration with improved layout
 display:
   - platform: lcd_pcf8574
     dimensions: 16x2
+    address: 0x3F  # May need to be adjusted based on your I2C scan results
     lambda: |-
-      it.printf(0, 0, "pH: %.2f", id(ph).state);
+      // Display time in top right corner
+      //if (id(sntp_time).now().is_valid()) {
+      //  it.printf(11, 1, "%02d:%02d", id(sntp_time).now().hour, id(sntp_time).now().minute);
+      //}
+
+      
+      // Display pH value with more precise formatting
       if (id(ph).has_state()) {
-        float value = id(ph).state;
-        if (value < 4) {
-          it.print(0, 1, "Very acidic    ");
-        } else if (value < 5) {
-          it.print(0, 1, "Acidic         ");
-        } else if (value < 7) {
-          it.print(0, 1, "Acidic-ish     ");
-        } else if (value < 8) {
-          it.print(0, 1, "Neutral        ");
-        } else if (value < 10) {
-          it.print(0, 1, "Alkaline-ish   ");
-        } else if (value < 11) {
-          it.print(0, 1, "Alkaline       ");
-        } else {
-          it.print(0, 1, "Very alkaline  ");
-        }
+        it.printf(0, 0, "pH:%.2f", id(ph).state);
+        
+        // Display pH status description
+        it.print(0, 1, id(ph_status).state.c_str());
+      
+      } else {
+        it.print(0, 0, "pH: Calibrar");
+        it.print(0, 1, "Aguarde...");
       }
+
+      // Display voltage on line 2
+      if (id(ph_raw_voltage).has_state()) {
+        it.printf(10, 0, "%.4f", id(ph_raw_voltage).state);
+      } else {
+        it.print(10, 0, "V:---");
+      }
+
+## Add button for calibration mode (future enhancement)
+#binary_sensor:
+#  - platform: gpio
+#    pin:
+#      number: D3
+#      mode: INPUT_PULLUP
+#    name: "Calibration Button"
+#    id: cal_button
+#    filters:
+#      - delayed_on: 50ms
+#      - delayed_off: 50ms
+
